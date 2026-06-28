@@ -2,7 +2,8 @@
 
 A tiny Windows installer that sets up a [PAYDAY 2](https://store.steampowered.com/app/218620/)
 mod bundle for you. It **auto-detects** your PAYDAY 2 install folder, downloads
-the mods from GitHub, and copies them in — no manual file shuffling.
+the mods from GitHub, and copies them in — no manual file shuffling. Run it again
+later and it **updates in place**, keeping your install in sync with GitHub.
 
 The mods themselves live in a separate repo:
 [**rroig7/pd2-mods**](https://github.com/rroig7/pd2-mods). This repo is just the
@@ -41,6 +42,24 @@ PowerShell installer above).
 
 See the [mods repo](https://github.com/rroig7/pd2-mods) for the full list and a
 manual-install guide.
+
+## Updating & removal sync
+
+Run the installer again at any time to update. It compares your installed files
+against the latest bundle on GitHub and only touches what actually differs:
+
+- **New** files in the bundle are added.
+- **Changed** files are overwritten (line-ending-only differences are ignored,
+  so they aren't flagged as changes).
+- **Removed** files — anything the bundle no longer contains is **deleted** from
+  your install, and any folders left empty are pruned. This keeps your `mods/`
+  folder matching GitHub **exactly**, so dropped mods don't linger.
+
+Your own runtime state is never compared, overwritten, or deleted —
+`mods/logs/`, `mods/saves/`, and `mods/downloads/` are always left alone, even
+though they aren't part of the GitHub bundle.
+
+If everything is already in sync, the installer tells you there's nothing to do.
 
 ## How auto-detection works
 
