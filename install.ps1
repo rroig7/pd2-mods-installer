@@ -1,26 +1,31 @@
 <#
 .SYNOPSIS
-    Installs the pd2-mods bundle into your PAYDAY 2 folder.
+    Installs / updates the pd2-mods bundle in your PAYDAY 2 folder.
 
 .DESCRIPTION
-    Downloads the latest files from GitHub (rroig7/pd2-mods), auto-detects your
-    PAYDAY 2 Steam install folder, and copies WSOCK32.dll (the SuperBLT loader)
-    and the mods/ folder into it.
+    Auto-detects your PAYDAY 2 Steam install folder, downloads the latest files
+    from GitHub (rroig7/pd2-mods), and compares them against what's already
+    installed. If the mods are missing it installs them; if they're already
+    present it only prompts to update the files that actually changed. Volatile
+    user state (logs, saves, downloads) is never compared or overwritten.
 
 .PARAMETER GameDir
-    Optional. Path to your PAYDAY 2 install folder. If omitted, the script
-    auto-detects it from Steam.
+    Optional. Path to your PAYDAY 2 install folder. Auto-detected if omitted.
+
+.PARAMETER Force
+    Skip the confirmation prompt and apply changes automatically.
 
 .EXAMPLE
     irm https://raw.githubusercontent.com/rroig7/pd2-mods-installer/main/install.ps1 | iex
 
 .EXAMPLE
-    .\install.ps1 -GameDir "D:\Games\PAYDAY 2"
+    .\install.ps1 -GameDir "D:\Games\PAYDAY 2" -Force
 #>
 
 [CmdletBinding()]
 param(
-    [string]$GameDir
+    [string]$GameDir,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -31,6 +36,10 @@ $Branch    = 'main'
 $ZipUrl    = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
 $AppId     = '218620'   # PAYDAY 2 Steam App ID
 $GameExe   = 'payday2_win32_release.exe'
+
+# Paths that are per-user runtime state: never compared, never overwritten.
+$VolatilePrefixes = @('mods\logs\', 'mods\saves\', 'mods\downloads\')
+
 
 function Write-Step($msg)  { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "    $msg" -ForegroundColor Green }
@@ -99,6 +108,68 @@ function Find-Payday2 {
     return $null
 }
 
+# --- Update detection helpers -----------------------------------------------
+function Test-Volatile($rel) {
+    foreach ($p in $VolatilePrefixes) { if ($rel -like "$p*") { return $true } }
+    return $false
+}
+
+# True if the bundle already looks installed in $gameDir.
+function Test-ModsInstalled($gameDir) {
+    return (Test-Path (Join-Path $gameDir 'WSOCK32.dll')) -and
+           (Test-Path (Join-Path $gameDir 'mods\base'))
+}
+
+# Every installable file in the bundle (relative paths), excluding volatile state.
+function Get-BundleFiles($src) {
+    $files = New-Object System.Collections.Generic.List[string]
+    if (Test-Path (Join-Path $src 'WSOCK32.dll')) { $files.Add('WSOCK32.dll') }
+    foreach ($f in Get-ChildItem (Join-Path $src 'mods') -Recurse -File) {
+        $rel = $f.FullName.Substring($src.Length).TrimStart('\')
+        if (-not (Test-Volatile $rel)) { $files.Add($rel) }
+    }
+    return $files
+}
+
+# True if two files differ in content. Binary files (those containing a NUL
+# byte) compare byte-exact; text files are compared with line endings normalized
+# so a CRLF-vs-LF-only difference (e.g. from git autocrlf) is not a "change".
+function Test-FileChanged($srcFile, $destFile) {
+    if ((Get-FileHash $srcFile -Algorithm SHA1).Hash -eq
+        (Get-FileHash $destFile -Algorithm SHA1).Hash) { return $false }
+    $a = [IO.File]::ReadAllBytes($srcFile)
+    $b = [IO.File]::ReadAllBytes($destFile)
+    if (($a -contains 0) -or ($b -contains 0)) { return $true }   # binary
+    $sa = [Text.Encoding]::UTF8.GetString($a) -replace "`r`n", "`n"
+    $sb = [Text.Encoding]::UTF8.GetString($b) -replace "`r`n", "`n"
+    return ($sa -ne $sb)
+}
+
+# Compare bundle against what's installed. Returns New/Changed relative-path lists.
+function Get-PendingChanges($src, $gameDir) {
+    $new = New-Object System.Collections.Generic.List[string]
+    $changed = New-Object System.Collections.Generic.List[string]
+    foreach ($rel in Get-BundleFiles $src) {
+        $dest = Join-Path $gameDir $rel
+        if (-not (Test-Path $dest)) {
+            $new.Add($rel)
+        } elseif (Test-FileChanged (Join-Path $src $rel) $dest) {
+            $changed.Add($rel)
+        }
+    }
+    return [pscustomobject]@{ New = $new; Changed = $changed }
+}
+
+# Copy only the given relative paths from bundle into the game folder.
+function Copy-BundleFiles($src, $gameDir, $relPaths) {
+    foreach ($rel in $relPaths) {
+        $dest = Join-Path $gameDir $rel
+        $destDir = Split-Path $dest -Parent
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+        Copy-Item -Path (Join-Path $src $rel) -Destination $dest -Force
+    }
+}
+
 # --- Main --------------------------------------------------------------------
 try {
     [Net.ServicePointManager]::SecurityProtocol = `
@@ -120,14 +191,18 @@ try {
             throw "That folder doesn't contain $GameExe. Aborting."
         }
     }
-    Write-Ok "Installing to: $GameDir"
+    Write-Ok "Game folder: $GameDir"
+
+    $alreadyInstalled = Test-ModsInstalled $GameDir
+    if ($alreadyInstalled) { Write-Ok 'Mods already installed - checking for updates.' }
+    else                   { Write-Ok 'Mods not detected - will perform a fresh install.' }
 
     # 2. Download the bundle from GitHub
     $work = Join-Path ([IO.Path]::GetTempPath()) ("pd2mods_" + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     $zip = Join-Path $work 'bundle.zip'
 
-    Write-Step "Downloading mods from GitHub ($Repo)..."
+    Write-Step "Downloading latest mods from GitHub ($Repo)..."
     Invoke-WebRequest -Uri $ZipUrl -OutFile $zip -UseBasicParsing
     Write-Ok 'Download complete.'
 
@@ -139,26 +214,40 @@ try {
     if (-not $extracted) { throw 'Extraction failed: source folder not found.' }
     $src = $extracted.FullName
 
-    # 3. Copy the loader DLL
-    Write-Step 'Copying SuperBLT loader (WSOCK32.dll)...'
-    $dll = Join-Path $src 'WSOCK32.dll'
-    if (Test-Path $dll) {
-        Copy-Item -Path $dll -Destination $GameDir -Force
-        Write-Ok 'WSOCK32.dll installed.'
-    } else {
-        Write-Warn2 'WSOCK32.dll not present in bundle; skipping.'
+    # 3. Compare against what's installed
+    Write-Step 'Comparing with installed files...'
+    $changes = Get-PendingChanges $src $GameDir
+    $total = $changes.New.Count + $changes.Changed.Count
+
+    if ($alreadyInstalled -and $total -eq 0) {
+        Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host ''
+        Write-Host '  You already have the latest mods. Nothing to update.' -ForegroundColor Green
+        Write-Host ''
+        return
     }
 
-    # 4. Copy the mods folder (merge)
-    Write-Step 'Copying mods folder...'
-    $srcMods = Join-Path $src 'mods'
-    $dstMods = Join-Path $GameDir 'mods'
-    if (-not (Test-Path $dstMods)) { New-Item -ItemType Directory -Path $dstMods -Force | Out-Null }
-    # Copy the *contents* of mods\ so existing mods aren't wiped, only merged/updated
-    Copy-Item -Path (Join-Path $srcMods '*') -Destination $dstMods -Recurse -Force
-    Write-Ok 'Mods installed.'
+    Write-Ok "$($changes.New.Count) new file(s), $($changes.Changed.Count) updated file(s)."
+    foreach ($f in $changes.Changed) { Write-Host "      ~ $f" -ForegroundColor DarkYellow }
+    foreach ($f in $changes.New)     { Write-Host "      + $f" -ForegroundColor DarkGreen }
 
-    # 5. Clean up
+    # 4. Confirm
+    if (-not $Force) {
+        $verb = if ($alreadyInstalled) { 'update' } else { 'install' }
+        $ans = Read-Host "Apply these changes? [Y/n]"
+        if ($ans -and $ans -notmatch '^(y|yes)$') {
+            Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Warn2 "Cancelled. Nothing was changed."
+            return
+        }
+    }
+
+    # 5. Apply
+    Write-Step 'Installing files...'
+    Copy-BundleFiles $src $GameDir ($changes.New + $changes.Changed)
+    Write-Ok 'Files installed.'
+
+    # 6. Clean up
     Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host ''
