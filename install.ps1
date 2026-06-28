@@ -131,6 +131,23 @@ function Get-BundleFiles($src) {
     return $files
 }
 
+# Every installer-managed file currently in the game folder (WSOCK32.dll plus
+# everything under mods\), excluding volatile user state. Used to detect files
+# that were removed from the bundle and should be deleted so the install tree
+# matches GitHub exactly.
+function Get-InstalledFiles($gameDir) {
+    $files = New-Object System.Collections.Generic.List[string]
+    if (Test-Path (Join-Path $gameDir 'WSOCK32.dll')) { $files.Add('WSOCK32.dll') }
+    $modsDir = Join-Path $gameDir 'mods'
+    if (Test-Path $modsDir) {
+        foreach ($f in Get-ChildItem $modsDir -Recurse -File) {
+            $rel = $f.FullName.Substring($gameDir.Length).TrimStart('\')
+            if (-not (Test-Volatile $rel)) { $files.Add($rel) }
+        }
+    }
+    return $files
+}
+
 # True if two files differ in content. Binary files (those containing a NUL
 # byte) compare byte-exact; text files are compared with line endings normalized
 # so a CRLF-vs-LF-only difference (e.g. from git autocrlf) is not a "change".
@@ -145,11 +162,16 @@ function Test-FileChanged($srcFile, $destFile) {
     return ($sa -ne $sb)
 }
 
-# Compare bundle against what's installed. Returns New/Changed relative-path lists.
+# Compare bundle against what's installed. Returns New/Changed/Removed lists.
+# Removed = installer-managed files present in the game folder but no longer in
+# the bundle; deleting them keeps the mods tree matching GitHub exactly.
 function Get-PendingChanges($src, $gameDir) {
     $new = New-Object System.Collections.Generic.List[string]
     $changed = New-Object System.Collections.Generic.List[string]
-    foreach ($rel in Get-BundleFiles $src) {
+    $removed = New-Object System.Collections.Generic.List[string]
+
+    $bundleFiles = Get-BundleFiles $src
+    foreach ($rel in $bundleFiles) {
         $dest = Join-Path $gameDir $rel
         if (-not (Test-Path $dest)) {
             $new.Add($rel)
@@ -157,7 +179,14 @@ function Get-PendingChanges($src, $gameDir) {
             $changed.Add($rel)
         }
     }
-    return [pscustomobject]@{ New = $new; Changed = $changed }
+
+    $bundleSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in $bundleFiles) { [void]$bundleSet.Add($rel) }
+    foreach ($rel in Get-InstalledFiles $gameDir) {
+        if (-not $bundleSet.Contains($rel)) { $removed.Add($rel) }
+    }
+
+    return [pscustomobject]@{ New = $new; Changed = $changed; Removed = $removed }
 }
 
 # Copy only the given relative paths from bundle into the game folder.
@@ -167,6 +196,28 @@ function Copy-BundleFiles($src, $gameDir, $relPaths) {
         $destDir = Split-Path $dest -Parent
         if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
         Copy-Item -Path (Join-Path $src $rel) -Destination $dest -Force
+    }
+}
+
+# Delete the given relative paths from the game folder, then prune any
+# directories under mods\ that were left empty so the tree matches GitHub.
+function Remove-BundleFiles($gameDir, $relPaths) {
+    foreach ($rel in $relPaths) {
+        $dest = Join-Path $gameDir $rel
+        if (Test-Path $dest) { Remove-Item -Path $dest -Force -ErrorAction SilentlyContinue }
+    }
+    $modsDir = Join-Path $gameDir 'mods'
+    if (Test-Path $modsDir) {
+        # Deepest-first so parents empty out after their children are removed.
+        Get-ChildItem $modsDir -Recurse -Directory |
+            Sort-Object { $_.FullName.Length } -Descending |
+            ForEach-Object {
+                $rel = $_.FullName.Substring($gameDir.Length).TrimStart('\')
+                if ((-not (Test-Volatile "$rel\")) -and
+                    -not (Get-ChildItem $_.FullName -Force | Select-Object -First 1)) {
+                    Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
     }
 }
 
@@ -217,7 +268,7 @@ try {
     # 3. Compare against what's installed
     Write-Step 'Comparing with installed files...'
     $changes = Get-PendingChanges $src $GameDir
-    $total = $changes.New.Count + $changes.Changed.Count
+    $total = $changes.New.Count + $changes.Changed.Count + $changes.Removed.Count
 
     if ($alreadyInstalled -and $total -eq 0) {
         Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -227,9 +278,10 @@ try {
         return
     }
 
-    Write-Ok "$($changes.New.Count) new file(s), $($changes.Changed.Count) updated file(s)."
+    Write-Ok "$($changes.New.Count) new file(s), $($changes.Changed.Count) updated file(s), $($changes.Removed.Count) removed file(s)."
     foreach ($f in $changes.Changed) { Write-Host "      ~ $f" -ForegroundColor DarkYellow }
     foreach ($f in $changes.New)     { Write-Host "      + $f" -ForegroundColor DarkGreen }
+    foreach ($f in $changes.Removed) { Write-Host "      - $f" -ForegroundColor DarkRed }
 
     # 4. Confirm
     if (-not $Force) {
@@ -245,6 +297,10 @@ try {
     # 5. Apply
     Write-Step 'Installing files...'
     Copy-BundleFiles $src $GameDir ($changes.New + $changes.Changed)
+    if ($changes.Removed.Count -gt 0) {
+        Write-Step 'Removing files no longer in the bundle...'
+        Remove-BundleFiles $GameDir $changes.Removed
+    }
     Write-Ok 'Files installed.'
 
     # 6. Clean up

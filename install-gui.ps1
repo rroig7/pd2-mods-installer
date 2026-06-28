@@ -85,6 +85,18 @@ function Get-BundleFiles($src) {
     }
     return $files
 }
+function Get-InstalledFiles($gameDir) {
+    $files = New-Object System.Collections.Generic.List[string]
+    if (Test-Path (Join-Path $gameDir 'WSOCK32.dll')) { $files.Add('WSOCK32.dll') }
+    $modsDir = Join-Path $gameDir 'mods'
+    if (Test-Path $modsDir) {
+        foreach ($f in Get-ChildItem $modsDir -Recurse -File) {
+            $rel = $f.FullName.Substring($gameDir.Length).TrimStart('\')
+            if (-not (Test-Volatile $rel)) { $files.Add($rel) }
+        }
+    }
+    return $files
+}
 function Test-FileChanged($srcFile, $destFile) {
     if ((Get-FileHash $srcFile -Algorithm SHA1).Hash -eq
         (Get-FileHash $destFile -Algorithm SHA1).Hash) { return $false }
@@ -98,7 +110,10 @@ function Test-FileChanged($srcFile, $destFile) {
 function Get-PendingChanges($src, $gameDir) {
     $new = New-Object System.Collections.Generic.List[string]
     $changed = New-Object System.Collections.Generic.List[string]
-    foreach ($rel in Get-BundleFiles $src) {
+    $removed = New-Object System.Collections.Generic.List[string]
+
+    $bundleFiles = Get-BundleFiles $src
+    foreach ($rel in $bundleFiles) {
         $dest = Join-Path $gameDir $rel
         if (-not (Test-Path $dest)) {
             $new.Add($rel)
@@ -106,7 +121,14 @@ function Get-PendingChanges($src, $gameDir) {
             $changed.Add($rel)
         }
     }
-    return [pscustomobject]@{ New = $new; Changed = $changed }
+
+    $bundleSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rel in $bundleFiles) { [void]$bundleSet.Add($rel) }
+    foreach ($rel in Get-InstalledFiles $gameDir) {
+        if (-not $bundleSet.Contains($rel)) { $removed.Add($rel) }
+    }
+
+    return [pscustomobject]@{ New = $new; Changed = $changed; Removed = $removed }
 }
 function Copy-BundleFiles($src, $gameDir, $relPaths) {
     foreach ($rel in $relPaths) {
@@ -114,6 +136,24 @@ function Copy-BundleFiles($src, $gameDir, $relPaths) {
         $destDir = Split-Path $dest -Parent
         if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
         Copy-Item -Path (Join-Path $src $rel) -Destination $dest -Force
+    }
+}
+function Remove-BundleFiles($gameDir, $relPaths) {
+    foreach ($rel in $relPaths) {
+        $dest = Join-Path $gameDir $rel
+        if (Test-Path $dest) { Remove-Item -Path $dest -Force -ErrorAction SilentlyContinue }
+    }
+    $modsDir = Join-Path $gameDir 'mods'
+    if (Test-Path $modsDir) {
+        Get-ChildItem $modsDir -Recurse -Directory |
+            Sort-Object { $_.FullName.Length } -Descending |
+            ForEach-Object {
+                $rel = $_.FullName.Substring($gameDir.Length).TrimStart('\')
+                if ((-not (Test-Volatile "$rel\")) -and
+                    -not (Get-ChildItem $_.FullName -Force | Select-Object -First 1)) {
+                    Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
     }
 }
 
@@ -222,7 +262,7 @@ $install.Add_Click({
 
         Add-Log 'Comparing with installed files...'
         $changes = Get-PendingChanges $src $gameDir
-        $total = $changes.New.Count + $changes.Changed.Count
+        $total = $changes.New.Count + $changes.Changed.Count + $changes.Removed.Count
         $progress.Value = 75
 
         if ($installed -and $total -eq 0) {
@@ -233,13 +273,14 @@ $install.Add_Click({
             return
         }
 
-        Add-Log "$($changes.New.Count) new file(s), $($changes.Changed.Count) updated file(s)."
+        Add-Log "$($changes.New.Count) new file(s), $($changes.Changed.Count) updated file(s), $($changes.Removed.Count) removed file(s)."
         foreach ($f in $changes.Changed) { Add-Log "  ~ $f" }
         foreach ($f in $changes.New)     { Add-Log "  + $f" }
+        foreach ($f in $changes.Removed) { Add-Log "  - $f" }
 
         $summary = if ($installed) {
             "Updates are available:`n`n" +
-            "$($changes.Changed.Count) file(s) changed`n$($changes.New.Count) new file(s)`n`nInstall them now?"
+            "$($changes.Changed.Count) file(s) changed`n$($changes.New.Count) new file(s)`n$($changes.Removed.Count) file(s) removed`n`nApply them now?"
         } else {
             "$total file(s) will be installed.`n`nInstall the mods now?"
         }
@@ -252,6 +293,10 @@ $install.Add_Click({
 
         Add-Log 'Installing files...'
         Copy-BundleFiles $src $gameDir ($changes.New + $changes.Changed)
+        if ($changes.Removed.Count -gt 0) {
+            Add-Log 'Removing files no longer in the bundle...'
+            Remove-BundleFiles $gameDir $changes.Removed
+        }
         $progress.Value = 100
         Add-Log ''
         Add-Log 'Done! Launch PAYDAY 2 through Steam to play with mods.'
